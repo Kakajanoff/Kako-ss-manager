@@ -1,12 +1,5 @@
+cat > /root/ss.sh <<'EOF'
 #!/usr/bin/env bash
-# ss.sh - Single Shadowsocks (libev) manager (stable key) + minimalist stats
-# Usage:
-#   sudo bash ss.sh install        # one-time install
-#   sudo bash ss.sh                # show stats + current key (NO rotation)
-#   sudo bash ss.sh new [HOST] [TAG]   # rotate: generate new port+password and restart
-#   sudo bash ss.sh status         # stats only
-#   sudo bash ss.sh show           # show current key only
-
 set -euo pipefail
 
 METHOD="chacha20-ietf-poly1305"
@@ -29,7 +22,7 @@ install_once(){
   apt-get update -y
   apt-get install -y shadowsocks-libev openssl curl ca-certificates ethtool python3 >/dev/null
   date -Is > "$MARKER"
-  echo "Installed. Next runs won't install again."
+  echo "Installed."
 }
 
 rand_port(){
@@ -62,21 +55,16 @@ make_links(){
   local host="$1" port="$2" pass="$3" tag="$4"
   local tag_enc userinfo_b64 legacy_b64 sip002 legacy
   tag_enc="$(urlencode_min "$tag")"
-
-  # SIP002: ss://BASE64URL(method:pass)@host:port#tag
   userinfo_b64="$(printf '%s:%s' "$METHOD" "$pass" | b64url_nopad)"
   sip002="ss://${userinfo_b64}@${host}:${port}#${tag_enc}"
-
-  # Legacy: ss://BASE64(method:pass@host:port)#tag
   legacy_b64="$(printf '%s:%s@%s:%s' "$METHOD" "$pass" "$host" "$port" | base64 -w 0)"
   legacy="ss://${legacy_b64}#${tag_enc}"
-
   echo "$legacy" "$sip002"
 }
 
 write_config(){
   local port="$1" pass="$2"
-  cat > "$CFG" <<EOF
+  cat > "$CFG" <<EOF2
 {
   "server":["0.0.0.0"],
   "server_port": ${port},
@@ -87,7 +75,7 @@ write_config(){
   "reuse_port": true,
   "mode":"tcp_and_udp"
 }
-EOF
+EOF2
 }
 
 restart_service(){
@@ -113,30 +101,29 @@ rate_mbps(){
   sleep 1
   rx2="$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)"
   tx2="$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)"
-
   python3 - <<PY
-rx=(${rx2}-${rx1})
-tx=(${tx2}-${tx1})
+rx=(${rx2}-${rx1}); tx=(${tx2}-${tx1})
 print(f"{rx*8/1e6:.2f} {tx*8/1e6:.2f}")
 PY
 }
 
-connected_ips_current_port(){
-  # current port from config (no jq dependency)
-  local port
-  port="$(grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CFG" 2>/dev/null || true)"
-  [[ -n "${port:-}" ]] || { echo "0"; return; }
-  ss -Hnt "sport = :${port}" 2>/dev/null \
-    | awk '{print $5}' | sed 's/:\([0-9]\+\)$//' | sort -u | wc -l | tr -d ' '
+current_port(){
+  grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CFG" 2>/dev/null || true
+}
+
+connected_ips(){
+  local port="$1"
+  [[ -n "$port" ]] || { echo 0; return; }
+  ss -Hnt "sport = :${port}" 2>/dev/null | awk '{print $5}' | sed 's/:\([0-9]\+\)$//' | sort -u | wc -l | tr -d ' '
 }
 
 status_view(){
-  local iface speed rx tx conn port
+  local iface speed rx tx port conn
   iface="$(default_iface || true)"; [[ -n "${iface:-}" ]] || iface="eth0"
   speed="$(iface_speed "$iface" || true)"
   read -r rx tx < <(rate_mbps "$iface" 2>/dev/null || echo "0.00 0.00")
-  port="$(grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CFG" 2>/dev/null || echo "-")"
-  conn="$(connected_ips_current_port || echo 0)"
+  port="$(current_port || true)"
+  conn="$(connected_ips "$port")"
 
   echo "=== SYSTEM ==="
   echo "Uptime : $(uptime -p 2>/dev/null || true)"
@@ -144,21 +131,24 @@ status_view(){
   echo "RAM    : $(free -m | awk '/Mem:/ {printf "%d/%d MB (free %d)\n",$3,$2,$4}')"
   echo "Disk / : $(df -h / | awk 'NR==2{print $3"/"$2" used ("$5")"}')"
   echo
-  echo "=== NETWORK ==="
+  echo "=== NET ==="
   echo "Iface  : ${iface}"
   echo "Link   : ${speed:-Unknown}"
   echo "Now    : RX ${rx} Mbps | TX ${tx} Mbps"
   echo
-  echo "=== SHADOWSOCKS ==="
+  echo "=== SS ==="
   systemctl is-active "$UNIT" >/dev/null 2>&1 && echo "Service: active" || echo "Service: inactive"
-  echo "Port   : ${port}"
-  echo "Conn   : ${conn} (unique IP)"
+  echo "Port   : ${port:-?}"
+  echo "Conn   : ${conn}"
   echo
 }
 
-show_key(){
-  [[ -f "$LAST" ]] || { echo "No key yet. Create one: sudo bash $0 new"; exit 1; }
-  cat "$LAST"
+show_links_only(){
+  if [[ -f "$LAST" ]]; then
+    grep -E '^(LEGACY=|SIP002=)' "$LAST" | cut -d= -f2-
+  else
+    echo "No key yet. Create: sudo bash $0 new"
+  fi
 }
 
 new_key(){
@@ -174,12 +164,12 @@ new_key(){
 
   read -r legacy sip002 < <(make_links "$host" "$port" "$pass" "$tag")
 
-  cat > "$LAST" <<EOF
+  cat > "$LAST" <<EOF3
 PORT=${port}
 PASSWORD=${pass}
 LEGACY=${legacy}
 SIP002=${sip002}
-EOF
+EOF3
 
   echo
   echo "=== COPY ==="
@@ -198,31 +188,26 @@ main(){
       install_once
       ;;
     status)
-      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
+      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
       status_view
       ;;
     show)
-      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
-      show_key
+      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
+      cat "$LAST" 2>/dev/null || echo "No key yet. Create: sudo bash $0 new"
       ;;
     new)
-      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
+      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
       status_view
       new_key "${2:-}" "${3:-ss}"
       ;;
     "" )
-      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
+      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
       status_view
-      echo "--- KEY (current) ---"
-      if [[ -f "$LAST" ]]; then
-        # sadece linkleri temiz göster
-        grep -E '^(LEGACY=|SIP002=)' "$LAST" | cut -d= -f2-
-      else
-        echo "No key yet. Create: sudo bash $0 new"
-      fi
-      echo "---------------------"
+      echo "--- KEY ---"
+      show_links_only
+      echo "----------"
       ;;
-    * )
+    *)
       echo "Usage: $0 [install|status|show|new]"
       exit 1
       ;;
@@ -230,3 +215,6 @@ main(){
 }
 
 main "$@"
+EOF
+
+chmod +x /root/ss.sh
