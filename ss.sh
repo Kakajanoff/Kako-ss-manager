@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# ss.sh - Single Shadowsocks (libev) manager: install once, overwrite config, restart, print ss:// links
+# ss.sh - Single Shadowsocks (libev) manager (stable key) + minimalist stats
 # Usage:
-#   sudo bash ss.sh install
-#   sudo bash ss.sh              # generate new key+port and restart
-#   sudo bash ss.sh status       # show minimalist system/network
-#   sudo bash ss.sh show         # print last generated links
+#   sudo bash ss.sh install        # one-time install
+#   sudo bash ss.sh                # show stats + current key (NO rotation)
+#   sudo bash ss.sh new [HOST] [TAG]   # rotate: generate new port+password and restart
+#   sudo bash ss.sh status         # stats only
+#   sudo bash ss.sh show           # show current key only
 
 set -euo pipefail
 
@@ -17,17 +18,11 @@ CFG="/etc/shadowsocks-libev/config.json"
 OUTDIR="/root/ss_keys"
 LAST="${OUTDIR}/current.txt"
 UNIT="shadowsocks-libev-server@config"
-MARKER="/var/lib/ssmgr/installed"   # unified marker path (simple)
+MARKER="/var/lib/ssmgr/installed"
 
 need_root(){ [[ ${EUID} -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }; }
-
-ensure_dirs(){
-  mkdir -p "$OUTDIR" "$(dirname "$MARKER")"
-}
-
-installed_ok(){
-  [[ -f "$MARKER" ]] && command -v ss-server >/dev/null 2>&1
-}
+ensure_dirs(){ mkdir -p "$OUTDIR" "$(dirname "$MARKER")"; }
+installed_ok(){ [[ -f "$MARKER" ]] && command -v ss-server >/dev/null 2>&1; }
 
 install_once(){
   export DEBIAN_FRONTEND=noninteractive
@@ -126,11 +121,22 @@ print(f"{rx*8/1e6:.2f} {tx*8/1e6:.2f}")
 PY
 }
 
+connected_ips_current_port(){
+  # current port from config (no jq dependency)
+  local port
+  port="$(grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CFG" 2>/dev/null || true)"
+  [[ -n "${port:-}" ]] || { echo "0"; return; }
+  ss -Hnt "sport = :${port}" 2>/dev/null \
+    | awk '{print $5}' | sed 's/:\([0-9]\+\)$//' | sort -u | wc -l | tr -d ' '
+}
+
 status_view(){
-  local iface speed rx tx
+  local iface speed rx tx conn port
   iface="$(default_iface || true)"; [[ -n "${iface:-}" ]] || iface="eth0"
   speed="$(iface_speed "$iface" || true)"
   read -r rx tx < <(rate_mbps "$iface" 2>/dev/null || echo "0.00 0.00")
+  port="$(grep -oP '"server_port"\s*:\s*\K[0-9]+' "$CFG" 2>/dev/null || echo "-")"
+  conn="$(connected_ips_current_port || echo 0)"
 
   echo "=== SYSTEM ==="
   echo "Uptime : $(uptime -p 2>/dev/null || true)"
@@ -143,16 +149,19 @@ status_view(){
   echo "Link   : ${speed:-Unknown}"
   echo "Now    : RX ${rx} Mbps | TX ${tx} Mbps"
   echo
-  systemctl is-active "$UNIT" >/dev/null 2>&1 && echo "SS     : active" || echo "SS     : inactive"
-  [[ -f "$LAST" ]] && echo "Key    : $LAST"
+  echo "=== SHADOWSOCKS ==="
+  systemctl is-active "$UNIT" >/dev/null 2>&1 && echo "Service: active" || echo "Service: inactive"
+  echo "Port   : ${port}"
+  echo "Conn   : ${conn} (unique IP)"
+  echo
 }
 
-show_last(){
-  [[ -f "$LAST" ]] || { echo "No key yet. Run: sudo bash $0"; exit 1; }
+show_key(){
+  [[ -f "$LAST" ]] || { echo "No key yet. Create one: sudo bash $0 new"; exit 1; }
   cat "$LAST"
 }
 
-generate(){
+new_key(){
   local host="${1:-}" tag="${2:-ss}"
   [[ -n "$host" ]] || host="$(detect_host)"
 
@@ -165,7 +174,6 @@ generate(){
 
   read -r legacy sip002 < <(make_links "$host" "$port" "$pass" "$tag")
 
-  # overwrite last file each run
   cat > "$LAST" <<EOF
 PORT=${port}
 PASSWORD=${pass}
@@ -173,7 +181,6 @@ LEGACY=${legacy}
 SIP002=${sip002}
 EOF
 
-  # copy block: ONLY links
   echo
   echo "=== COPY ==="
   echo "${legacy}"
@@ -191,19 +198,32 @@ main(){
       install_once
       ;;
     status)
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
+      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
       status_view
       ;;
     show)
-      show_last
+      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
+      show_key
+      ;;
+    new)
+      installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
+      status_view
+      new_key "${2:-}" "${3:-ss}"
       ;;
     "" )
       installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
       status_view
-      generate "${2:-}" "${3:-ss}"
+      echo "--- KEY (current) ---"
+      if [[ -f "$LAST" ]]; then
+        # sadece linkleri temiz göster
+        grep -E '^(LEGACY=|SIP002=)' "$LAST" | cut -d= -f2-
+      else
+        echo "No key yet. Create: sudo bash $0 new"
+      fi
+      echo "---------------------"
       ;;
     * )
-      echo "Usage: $0 [install|status|show]"
+      echo "Usage: $0 [install|status|show|new]"
       exit 1
       ;;
   esac
