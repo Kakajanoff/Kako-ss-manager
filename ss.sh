@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# ss.sh - Minimal Shadowsocks multi-key manager + clean stats
-# 1) One-time install:
-#    sudo bash /root/ss.sh install
-# 2) Run:
-#    sudo bash /root/ss.sh
+# ss.sh - Single Shadowsocks (libev) manager: install once, overwrite config, restart, print ss:// links
+# Usage:
+#   sudo bash ss.sh install
+#   sudo bash ss.sh              # generate new key+port and restart
+#   sudo bash ss.sh status       # show minimalist system/network
+#   sudo bash ss.sh show         # print last generated links
 
 set -euo pipefail
 
@@ -12,45 +13,28 @@ PORT_MIN=1024
 PORT_MAX=10000
 PASS_LEN=32
 
-USERS_DIR="/etc/shadowsocks-libev/users"
+CFG="/etc/shadowsocks-libev/config.json"
 OUTDIR="/root/ss_keys"
-DB_CSV="${OUTDIR}/keys.csv"
-UNIT="/etc/systemd/system/ss-user@.service"
-MARKER="/var/lib/ssmgr/installed"
+LAST="${OUTDIR}/current.txt"
+UNIT="shadowsocks-libev-server@config"
+MARKER="/var/lib/ssmgr/installed"   # unified marker path (simple)
 
 need_root(){ [[ ${EUID} -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }; }
 
 ensure_dirs(){
-  mkdir -p "$USERS_DIR" "$OUTDIR" "$(dirname "$MARKER")"
-  [[ -f "$DB_CSV" ]] || echo "id,created_at,host,port,method,password,tag,sip002,legacy" > "$DB_CSV"
+  mkdir -p "$OUTDIR" "$(dirname "$MARKER")"
 }
 
 installed_ok(){
-  [[ -f "$MARKER" ]] && [[ -f "$UNIT" ]] && command -v ss-server >/dev/null 2>&1
+  [[ -f "$MARKER" ]] && command -v ss-server >/dev/null 2>&1
 }
 
-install_deps_once(){
+install_once(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y shadowsocks-libev openssl curl ca-certificates ethtool >/dev/null
-
-  cat > "$UNIT" <<'EOF'
-[Unit]
-Description=Shadowsocks user instance (%i)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/ss-server -c /etc/shadowsocks-libev/users/%i.json
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
+  apt-get install -y shadowsocks-libev openssl curl ca-certificates ethtool python3 >/dev/null
   date -Is > "$MARKER"
+  echo "Installed. Next runs won't install again."
 }
 
 rand_port(){
@@ -77,39 +61,43 @@ detect_host(){
 }
 
 b64url_nopad(){ base64 -w 0 | tr '+/' '-_' | tr -d '='; }
-
-urlencode_min(){
-  local s="$1"
-  s="${s// /%20}"
-  s="${s//#/%23}"
-  echo "$s"
-}
+urlencode_min(){ local s="$1"; s="${s// /%20}"; s="${s//#/%23}"; echo "$s"; }
 
 make_links(){
   local host="$1" port="$2" pass="$3" tag="$4"
   local tag_enc userinfo_b64 legacy_b64 sip002 legacy
-
   tag_enc="$(urlencode_min "$tag")"
 
-  # SIP002
+  # SIP002: ss://BASE64URL(method:pass)@host:port#tag
   userinfo_b64="$(printf '%s:%s' "$METHOD" "$pass" | b64url_nopad)"
   sip002="ss://${userinfo_b64}@${host}:${port}#${tag_enc}"
 
-  # Legacy (çok client’ta sorunsuz)
+  # Legacy: ss://BASE64(method:pass@host:port)#tag
   legacy_b64="$(printf '%s:%s@%s:%s' "$METHOD" "$pass" "$host" "$port" | base64 -w 0)"
   legacy="ss://${legacy_b64}#${tag_enc}"
 
-  echo "$sip002" "$legacy"
+  echo "$legacy" "$sip002"
 }
 
-connected_ips_for_port(){
-  local port="$1"
-  ss -Hnt "sport = :${port}" 2>/dev/null \
-    | awk '{print $5}' \
-    | sed 's/:\([0-9]\+\)$//' \
-    | sort -u \
-    | wc -l \
-    | tr -d ' '
+write_config(){
+  local port="$1" pass="$2"
+  cat > "$CFG" <<EOF
+{
+  "server":["0.0.0.0"],
+  "server_port": ${port},
+  "password":"${pass}",
+  "timeout":300,
+  "method":"${METHOD}",
+  "fast_open": true,
+  "reuse_port": true,
+  "mode":"tcp_and_udp"
+}
+EOF
+}
+
+restart_service(){
+  systemctl enable --now "$UNIT" >/dev/null 2>&1 || true
+  systemctl restart "$UNIT"
 }
 
 default_iface(){
@@ -118,13 +106,11 @@ default_iface(){
 
 iface_speed(){
   local iface="$1"
-  if command -v ethtool >/dev/null 2>&1; then
-    ethtool "$iface" 2>/dev/null | awk -F': ' '/Speed:/{print $2; exit}'
-  fi
+  command -v ethtool >/dev/null 2>&1 || return 0
+  ethtool "$iface" 2>/dev/null | awk -F': ' '/Speed:/{print $2; exit}'
 }
 
 rate_mbps(){
-  # anlık hız (1 saniye) - gerçek akan trafik
   local iface="$1"
   local rx1 tx1 rx2 tx2
   rx1="$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)"
@@ -133,21 +119,16 @@ rate_mbps(){
   rx2="$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)"
   tx2="$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)"
 
-  # bytes/sec -> Mbps
   python3 - <<PY
 rx=(${rx2}-${rx1})
 tx=(${tx2}-${tx1})
-rx_mbps=rx*8/1e6
-tx_mbps=tx*8/1e6
-print(f"{rx_mbps:.2f} {tx_mbps:.2f}")
+print(f"{rx*8/1e6:.2f} {tx*8/1e6:.2f}")
 PY
 }
 
-mini_status(){
+status_view(){
   local iface speed rx tx
-  iface="$(default_iface || true)"
-  [[ -n "${iface:-}" ]] || iface="eth0"
-
+  iface="$(default_iface || true)"; [[ -n "${iface:-}" ]] || iface="eth0"
   speed="$(iface_speed "$iface" || true)"
   read -r rx tx < <(rate_mbps "$iface" 2>/dev/null || echo "0.00 0.00")
 
@@ -162,108 +143,43 @@ mini_status(){
   echo "Link   : ${speed:-Unknown}"
   echo "Now    : RX ${rx} Mbps | TX ${tx} Mbps"
   echo
+  systemctl is-active "$UNIT" >/dev/null 2>&1 && echo "SS     : active" || echo "SS     : inactive"
+  [[ -f "$LAST" ]] && echo "Key    : $LAST"
 }
 
-new_key(){
+show_last(){
+  [[ -f "$LAST" ]] || { echo "No key yet. Run: sudo bash $0"; exit 1; }
+  cat "$LAST"
+}
+
+generate(){
   local host="${1:-}" tag="${2:-ss}"
   [[ -n "$host" ]] || host="$(detect_host)"
 
-  local id port pass created cfg sip002 legacy
-  id="$(date +%Y%m%d-%H%M%S)-$RANDOM"
+  local port pass legacy sip002
   port="$(rand_port)"
   pass="$(rand_pass)"
-  created="$(date -Is)"
 
-  cfg="${USERS_DIR}/${id}.json"
-  cat > "$cfg" <<EOF
-{
-  "server":["0.0.0.0"],
-  "server_port": ${port},
-  "password":"${pass}",
-  "timeout":300,
-  "method":"${METHOD}",
-  "fast_open": true,
-  "reuse_port": true,
-  "mode":"tcp_and_udp"
-}
+  write_config "$port" "$pass"
+  restart_service
+
+  read -r legacy sip002 < <(make_links "$host" "$port" "$pass" "$tag")
+
+  # overwrite last file each run
+  cat > "$LAST" <<EOF
+PORT=${port}
+PASSWORD=${pass}
+LEGACY=${legacy}
+SIP002=${sip002}
 EOF
 
-  read -r sip002 legacy < <(make_links "$host" "$port" "$pass" "$tag")
-
-  systemctl enable "ss-user@${id}.service" >/dev/null 2>&1 || true
-  systemctl restart "ss-user@${id}.service" >/dev/null
-
-  echo "${id},${created},${host},${port},${METHOD},${pass},${tag},${sip002},${legacy}" >> "$DB_CSV"
-
-  # “current.txt” her seferinde overwrite (tek key)
-  {
-    echo "PORT=${port}"
-    echo "PASSWORD=${pass}"
-    echo "LEGACY=${legacy}"
-    echo "SIP002=${sip002}"
-  } > "${OUTDIR}/current.txt"
-
-  # KOPYALAMA İÇİN: SADECE LINKLER (tek başına)
+  # copy block: ONLY links
   echo
   echo "=== COPY ==="
   echo "${legacy}"
   echo "${sip002}"
   echo "==========="
   echo
-  echo "Port: ${port}  (service: ss-user@${id}.service)"
-}
-
-list_keys(){
-  echo "=== KEYS (PORT | CONNECTED) ==="
-  tail -n +2 "$DB_CSV" | while IFS=',' read -r id created host port method pass tag sip002 legacy; do
-    [[ -z "${id:-}" ]] && continue
-    local c
-    c="$(connected_ips_for_port "$port" || echo 0)"
-    printf "%-6s | %s\n" "$port" "$c"
-  done
-  echo "==============================="
-  echo
-}
-
-del_key(){
-  local id="${1:-}"
-  [[ -n "$id" ]] || { echo "Usage: $0 del <ID>"; exit 1; }
-
-  systemctl stop "ss-user@${id}.service" >/dev/null 2>&1 || true
-  systemctl disable "ss-user@${id}.service" >/dev/null 2>&1 || true
-  rm -f "${USERS_DIR}/${id}.json" >/dev/null 2>&1 || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
-  awk -F',' -v id="$id" 'NR==1{print;next} $1!=id{print}' "$DB_CSV" > "${DB_CSV}.tmp"
-  mv "${DB_CSV}.tmp" "$DB_CSV"
-  echo "Deleted: $id"
-}
-
-menu(){
-  echo "1) Status"
-  echo "2) Keys (port|connected)"
-  echo "3) New key"
-  echo "4) Delete key (by ID)"
-  echo "5) Exit"
-  echo -n "> "
-  read -r ch
-  case "$ch" in
-    1) mini_status ;;
-    2) list_keys ;;
-    3)
-      echo -n "HOST (blank=auto public IP): "
-      read -r host
-      echo -n "TAG  (blank=ss): "
-      read -r tag
-      new_key "${host:-}" "${tag:-ss}"
-      ;;
-    4)
-      echo -n "ID: "
-      read -r id
-      del_key "$id"
-      ;;
-    *) exit 0 ;;
-  esac
 }
 
 main(){
@@ -272,29 +188,22 @@ main(){
 
   case "${1:-}" in
     install)
-      install_deps_once
-      echo "Installed. Next runs will not install again."
+      install_once
       ;;
-    new)
+    status)
       installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
-      new_key "${2:-}" "${3:-ss}"
+      status_view
       ;;
-    list)
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
-      list_keys
-      ;;
-    del)
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
-      del_key "${2:-}"
+    show)
+      show_last
       ;;
     "" )
       installed_ok || { echo "Not installed. Run once: sudo bash $0 install"; exit 1; }
-      mini_status
-      list_keys
-      while :; do menu; done
+      status_view
+      generate "${2:-}" "${3:-ss}"
       ;;
-    *)
-      echo "Usage: $0 [install|new|list|del]"
+    * )
+      echo "Usage: $0 [install|status|show]"
       exit 1
       ;;
   esac
