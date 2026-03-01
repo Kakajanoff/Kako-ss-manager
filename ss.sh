@@ -1,4 +1,3 @@
-cat > /root/ss.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -15,14 +14,16 @@ MARKER="/var/lib/ssmgr/installed"
 
 need_root(){ [[ ${EUID} -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }; }
 ensure_dirs(){ mkdir -p "$OUTDIR" "$(dirname "$MARKER")"; }
-installed_ok(){ [[ -f "$MARKER" ]] && command -v ss-server >/dev/null 2>&1; }
+
+installed_ok(){
+  [[ -f "$MARKER" ]] && command -v ss-server >/dev/null 2>&1
+}
 
 install_once(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y shadowsocks-libev openssl curl ca-certificates ethtool python3 >/dev/null
   date -Is > "$MARKER"
-  echo "Installed."
 }
 
 rand_port(){
@@ -64,7 +65,7 @@ make_links(){
 
 write_config(){
   local port="$1" pass="$2"
-  cat > "$CFG" <<EOF2
+  cat > "$CFG" <<EOF
 {
   "server":["0.0.0.0"],
   "server_port": ${port},
@@ -75,7 +76,7 @@ write_config(){
   "reuse_port": true,
   "mode":"tcp_and_udp"
 }
-EOF2
+EOF
 }
 
 restart_service(){
@@ -143,12 +144,43 @@ status_view(){
   echo
 }
 
-show_links_only(){
+print_links(){
   if [[ -f "$LAST" ]]; then
     grep -E '^(LEGACY=|SIP002=)' "$LAST" | cut -d= -f2-
   else
-    echo "No key yet. Create: sudo bash $0 new"
+    echo "No key yet."
   fi
+}
+
+create_key_if_missing(){
+  # Eğer hiç key yoksa: otomatik oluştur
+  if [[ -f "$LAST" ]] && [[ -f "$CFG" ]]; then
+    return
+  fi
+
+  local host tag port pass legacy sip002
+  host="$(detect_host)"
+  tag="ss"
+  port="$(rand_port)"
+  pass="$(rand_pass)"
+
+  write_config "$port" "$pass"
+  restart_service
+
+  read -r legacy sip002 < <(make_links "$host" "$port" "$pass" "$tag")
+
+  cat > "$LAST" <<EOF
+PORT=${port}
+PASSWORD=${pass}
+LEGACY=${legacy}
+SIP002=${sip002}
+EOF
+
+  echo "=== COPY (first key created) ==="
+  echo "$legacy"
+  echo "$sip002"
+  echo "==============================="
+  echo
 }
 
 new_key(){
@@ -164,18 +196,17 @@ new_key(){
 
   read -r legacy sip002 < <(make_links "$host" "$port" "$pass" "$tag")
 
-  cat > "$LAST" <<EOF3
+  cat > "$LAST" <<EOF
 PORT=${port}
 PASSWORD=${pass}
 LEGACY=${legacy}
 SIP002=${sip002}
-EOF3
+EOF
 
-  echo
-  echo "=== COPY ==="
-  echo "${legacy}"
-  echo "${sip002}"
-  echo "==========="
+  echo "=== COPY (new key) ==="
+  echo "$legacy"
+  echo "$sip002"
+  echo "======================"
   echo
 }
 
@@ -183,38 +214,38 @@ main(){
   need_root
   ensure_dirs
 
+  # Kurulu değilse 1 kere kur (sonra marker var diye tekrar yapmaz)
+  if [[ "${1:-}" != "install" ]] && ! installed_ok; then
+    install_once
+  fi
+
   case "${1:-}" in
     install)
       install_once
       ;;
-    status)
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
-      status_view
-      ;;
-    show)
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
-      cat "$LAST" 2>/dev/null || echo "No key yet. Create: sudo bash $0 new"
-      ;;
     new)
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
       status_view
       new_key "${2:-}" "${3:-ss}"
       ;;
+    status)
+      status_view
+      ;;
+    show)
+      cat "$LAST" 2>/dev/null || echo "No key yet."
+      ;;
     "" )
-      installed_ok || { echo "Not installed. Run: sudo bash $0 install"; exit 1; }
+      # normal çalıştırma: key yoksa oluştur, varsa sadece göster
+      create_key_if_missing
       status_view
       echo "--- KEY ---"
-      show_links_only
+      print_links
       echo "----------"
       ;;
     *)
-      echo "Usage: $0 [install|status|show|new]"
+      echo "Usage: $0 [install|new|status|show]"
       exit 1
       ;;
   esac
 }
 
 main "$@"
-EOF
-
-chmod +x /root/ss.sh
