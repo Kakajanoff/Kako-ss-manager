@@ -5,6 +5,7 @@ set -euo pipefail
 DO_IP="161.35.213.138"
 DO_SSH_USER="root"
 DO_SSH_PORT="22"
+DO_SSH_PASS="CHANGE_ME"   # <-- BURAYA DO ROOT SSH PAROLASINI YAZ
 
 METHOD="chacha20-ietf-poly1305"
 PORT_MIN=1024
@@ -57,7 +58,6 @@ ipt_add(){
   iptables -t "$table" -A "$chain" "$@"
 }
 ipt_del_all(){
-  # delete matching rules repeatedly (best-effort)
   local table="$1"; shift
   local chain="$1"; shift
   while iptables -t "$table" -D "$chain" "$@" >/dev/null 2>&1; do :; done
@@ -89,16 +89,13 @@ apply_forward(){
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ss-do-forward.conf
 
-  # DNAT GCORE:PORT -> DO:PORT (TCP+UDP)  (friend script does this) 1
   ipt_add nat PREROUTING -i "$iface" -p tcp --dport "$port" -j DNAT --to-destination "${DO_IP}:${port}"
   ipt_add nat PREROUTING -i "$iface" -p udp --dport "$port" -j DNAT --to-destination "${DO_IP}:${port}"
 
-  # allow forward
   ipt_add filter FORWARD -i "$iface" -p tcp -d "$DO_IP" --dport "$port" -j ACCEPT
   ipt_add filter FORWARD -i "$iface" -p udp -d "$DO_IP" --dport "$port" -j ACCEPT
   ipt_add filter FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-  # outbound masquerade (like friend) 2
   ipt_add nat POSTROUTING -j MASQUERADE
 
   iptables-save > "$FW_RULES"
@@ -116,11 +113,15 @@ remove_forward(){
 }
 
 ssh_do(){
-  ssh -o StrictHostKeyChecking=accept-new -p "$DO_SSH_PORT" "${DO_SSH_USER}@${DO_IP}" "$@"
+  # SSH password fixed via sshpass (no prompt)
+  sshpass -p "${DO_SSH_PASS}" ssh \
+    -o StrictHostKeyChecking=accept-new \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -p "$DO_SSH_PORT" "${DO_SSH_USER}@${DO_IP}" "$@"
 }
 
 ensure_do_backend(){
-  # install shadowsocks-libev ON DO once
   ssh_do "test -f '${DO_MARKER}' && exit 0; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update -y && apt-get install -y shadowsocks-libev openssl ca-certificates >/dev/null; \
@@ -129,7 +130,6 @@ ensure_do_backend(){
 
 write_do_ss_config(){
   local port="$1" pass="$2"
-  # write /etc/shadowsocks-libev/config.json ON DO + restart
   ssh_do "cat > /etc/shadowsocks-libev/config.json <<'EOF'
 {
   \"server\":[\"0.0.0.0\"],
@@ -161,7 +161,6 @@ create_if_missing(){
   ensure_do_backend
   write_do_ss_config "$port" "$pass"
 
-  mkdir -p /root/ss_keys
   cat > "$KEYFILE" <<EOF
 METHOD=${METHOD}
 PORT=${port}
@@ -217,20 +216,28 @@ main(){
   need_root
   mkdirs
 
-  # ensure base tools on Gcore
+  # Ensure base tools on Gcore (add sshpass)
   if [[ ! -f "$MARKER" ]]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y iptables curl openssl ca-certificates >/dev/null 2>&1 || true
+    apt-get install -y iptables curl openssl ca-certificates sshpass >/dev/null 2>&1 || true
+  else
+    command -v sshpass >/dev/null 2>&1 || {
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y >/dev/null 2>&1 || true
+      apt-get install -y sshpass >/dev/null 2>&1 || true
+    }
+  fi
+
+  # basic guard
+  if [[ "${DO_SSH_PASS}" == "CHANGE_ME" ]]; then
+    echo "ERROR: Set DO_SSH_PASS in script first."
+    exit 1
   fi
 
   case "${1:-}" in
-    new)
-      rotate_new
-      ;;
-    show)
-      show
-      ;;
+    new)  rotate_new ;;
+    show) show ;;
     "" )
       create_if_missing
       echo "GCORE IP: $(gcore_public_ip)"
@@ -241,10 +248,7 @@ main(){
       show
       echo "==========="
       ;;
-    *)
-      echo "Usage: sudo bash $0 [new|show]"
-      exit 1
-      ;;
+    *) echo "Usage: sudo bash $0 [new|show]"; exit 1 ;;
   esac
 }
 
